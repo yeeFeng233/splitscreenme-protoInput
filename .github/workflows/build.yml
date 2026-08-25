@@ -51,6 +51,45 @@ jobs:
             Write-Host "OK source API: $symbol"
           }
 
+
+          # Verify the path assumptions used later in this workflow against
+          # the checked-out project files before spending time compiling.
+          $checks = @(
+            @{
+              File = "lib\Blackbone\src\BlackBone\BlackBone.vcxproj"
+              Text = '$(SolutionDir)build\$(Platform)\$(Configuration)\'
+              Name = "BlackBone OutDir"
+            },
+            @{
+              File = "src\ProtoInput\ProtoInputUtil\ProtoInputUtil.vcxproj"
+              Text = '$(SolutionDir)build\x64\Release'
+              Name = "ProtoInputUtil BlackBone library directory"
+            },
+            @{
+              File = "src\ProtoInput\ProtoInputHooks\ProtoInputHooks.vcxproj"
+              Text = '$(SolutionDir)build\x64\Release'
+              Name = "ProtoInputHooks BlackBone library directory"
+            },
+            @{
+              File = "src\ProtoInput\ProtoInputLoader\ProtoInputLoader.vcxproj"
+              Text = '$(SolutionDir)build\x64\Release'
+              Name = "ProtoInputLoader BlackBone library directory"
+            },
+            @{
+              File = "lib\openxinput-OpenXinput1_4\OpenXinput.vcxproj"
+              Text = "DEVOBJ.lib"
+              Name = "OpenXinput DEVOBJ dependency"
+            }
+          )
+
+          foreach ($c in $checks) {
+            $body = Get-Content $c.File -Raw
+            if (-not $body.Contains($c.Text)) {
+              throw "Source-layout assumption changed: $($c.Name) [$($c.File)]"
+            }
+            Write-Host "OK layout assumption: $($c.Name)"
+          }
+
       - name: Install v142 ATL if missing
         shell: powershell
         run: |
@@ -140,29 +179,55 @@ jobs:
           if (-not (Test-Path $p)) { throw "Missing: $p" }
           Get-Item $p | Select-Object FullName,Length,LastWriteTime | Format-Table -AutoSize
 
+      # BlackBone also uses $(SolutionDir) for OutDir/IntDir.
+      # When a .vcxproj is built directly, SolutionDir otherwise resolves
+      # relative to the BlackBone project itself, producing:
+      #   lib\Blackbone\src\BlackBone\build\x64\Release\BlackBone.lib
+      # ProtoInput projects, however, search:
+      #   $(SolutionDir)build\x64\Release
+      # with SolutionDir = src\ProtoInput\.
+      # Therefore force the same SolutionDir here.
       - name: Build 02 - BlackBone
-        shell: cmd
-        run: >
-          msbuild lib\Blackbone\src\BlackBone\BlackBone.vcxproj
-          /m:1
-          /t:Build
-          /p:Configuration=Release
-          /p:Platform=x64
-          /p:WindowsTargetPlatformVersion=10.0.19041.0
-          /p:PlatformToolset=v142
-          /verbosity:minimal
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $solutionDir = (Resolve-Path "src\ProtoInput").Path + "\"
+
+          Write-Host "SolutionDir = $solutionDir"
+
+          & msbuild "lib\Blackbone\src\BlackBone\BlackBone.vcxproj" `
+            /m:1 `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+            /p:PlatformToolset=v142 `
+            "/p:SolutionDir=$solutionDir" `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "BlackBone build failed: $LASTEXITCODE"
+          }
 
       - name: Verify 02 - BlackBone.lib
         shell: powershell
         run: |
-          $p = "src\ProtoInput\build\x64\Release\BlackBone.lib"
-          if (-not (Test-Path $p)) {
+          $ErrorActionPreference = "Stop"
+
+          $expected = Join-Path $PWD "src\ProtoInput\build\x64\Release\BlackBone.lib"
+
+          if (-not (Test-Path $expected)) {
             Write-Host "BlackBone candidates:"
             Get-ChildItem . -Recurse -File -Filter "BlackBone.lib" |
-              Select-Object FullName,Length | Format-Table -AutoSize
-            throw "Missing expected BlackBone.lib: $p"
+              Select-Object FullName,Length,LastWriteTime |
+              Format-Table -AutoSize
+            throw "Missing expected BlackBone.lib: $expected"
           }
-          Get-Item $p | Select-Object FullName,Length,LastWriteTime | Format-Table -AutoSize
+
+          Write-Host "BlackBone is at the exact path used by ProtoInputUtil/Hooks/Loader:"
+          Get-Item $expected |
+            Select-Object FullName,Length,LastWriteTime |
+            Format-Table -AutoSize
 
       # DEVOBJ uses $(SolutionDir) to decide its output location.
       # Explicitly set it to the directory containing ProtoInput.sln.
