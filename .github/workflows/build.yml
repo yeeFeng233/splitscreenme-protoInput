@@ -11,7 +11,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install missing v142 ATL
+      - name: Sanity-check current ProtoInput source
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $requiredProjects = @(
+            "lib\EasyHook\EasyHookDll\EasyHookDll.vcxproj",
+            "lib\Blackbone\src\BlackBone\BlackBone.vcxproj",
+            "lib\openxinput-OpenXinput1_4\DEVOBJ\DEVOBJ.vcxproj",
+            "lib\openxinput-OpenXinput1_4\OpenXinput.vcxproj",
+            "src\ProtoInput\ProtoInputUtil\ProtoInputUtil.vcxproj",
+            "src\ProtoInput\ProtoInputUtilDynamic\ProtoInputUtilDynamic.vcxproj",
+            "src\ProtoInput\ProtoInputInjectorProxy\ProtoInputInjectorProxy.vcxproj",
+            "src\ProtoInput\ProtoInputInjector\ProtoInputInjector.vcxproj",
+            "src\ProtoInput\ProtoInputHooks\ProtoInputHooks.vcxproj",
+            "src\ProtoInput\ProtoInputLoader\ProtoInputLoader.vcxproj",
+            "src\ProtoInput\ProtoInputHost\ProtoInputHost.vcxproj"
+          )
+
+          foreach ($p in $requiredProjects) {
+            if (-not (Test-Path $p)) {
+              throw "Required project is missing: $p"
+            }
+            Write-Host "OK project: $p"
+          }
+
+          $header = "src\ProtoInput\ProtoInputLoader\include\protoloader.h"
+          $text = Get-Content $header -Raw
+
+          foreach ($symbol in @(
+            "SetTranslateXinputtoMKB",
+            "SetXinputtoMKBkeys",
+            "SetXinputtoMKBCFG"
+          )) {
+            if ($text -notmatch [regex]::Escape($symbol)) {
+              throw "Current source tree does not contain required API: $symbol"
+            }
+            Write-Host "OK source API: $symbol"
+          }
+
+      - name: Install v142 ATL if missing
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -35,16 +75,12 @@ jobs:
 
           $atlHeader = Join-Path $v142.FullName "atlmfc\include\atlbase.h"
 
-          if (Test-Path $atlHeader) {
-            Write-Host "v142 ATL already installed:"
-            Write-Host "  $atlHeader"
-          }
-          else {
-            Write-Host "v142 ATL is missing. Installing it..."
+          if (-not (Test-Path $atlHeader)) {
+            Write-Host "v142 ATL missing; installing..."
 
             Set-Location "C:\Program Files (x86)\Microsoft Visual Studio\Installer"
 
-            $ArgumentList = @(
+            $args = @(
               "modify",
               "--installPath", "`"$vsPath`"",
               "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.ATL",
@@ -55,21 +91,20 @@ jobs:
 
             $p = Start-Process `
               -FilePath ".\vs_installer.exe" `
-              -ArgumentList $ArgumentList `
+              -ArgumentList $args `
               -Wait `
               -PassThru
 
             Write-Host "VS Installer exit code: $($p.ExitCode)"
-
-            if (-not (Test-Path $atlHeader)) {
-              throw "v142 ATL installation finished, but atlbase.h is still missing: $atlHeader"
-            }
           }
 
-          Write-Host "ATL check passed:"
-          Write-Host "  $atlHeader"
+          if (-not (Test-Path $atlHeader)) {
+            throw "v142 ATL is still missing: $atlHeader"
+          }
 
-      - name: Setup MSVC developer environment
+          Write-Host "ATL OK: $atlHeader"
+
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: amd64
@@ -78,15 +113,18 @@ jobs:
         shell: powershell
         run: |
           msbuild -version
-          Write-Host "`nInstalled Windows SDKs:"
+          Write-Host "`nWindows SDKs:"
           Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" |
             Select-Object -ExpandProperty Name
 
-      - name: Build EasyHook native x64 first
+      # EasyHook is special: its native project uses netfx4-Release|x64.
+      # Disable its managed ProjectReferences; those were the source of the
+      # Debug|x64 OutputPath failure seen in the first CI attempt.
+      - name: Build 01 - EasyHook64 static library
         shell: cmd
         run: >
           msbuild lib\EasyHook\EasyHookDll\EasyHookDll.vcxproj
-          /m
+          /m:1
           /t:Build
           /p:Configuration=netfx4-Release
           /p:Platform=x64
@@ -95,20 +133,18 @@ jobs:
           /p:BuildProjectReferences=false
           /verbosity:minimal
 
-      - name: Verify EasyHook64.lib
+      - name: Verify 01 - EasyHook64.lib
         shell: powershell
         run: |
-          $matches = Get-ChildItem "lib\EasyHook" -Recurse -File -Filter "EasyHook64.lib"
-          if (-not $matches) {
-            throw "EasyHook64.lib was not produced."
-          }
-          $matches | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize
+          $p = "lib\EasyHook\Build\x64\netfx4-Release\EasyHook64.lib"
+          if (-not (Test-Path $p)) { throw "Missing: $p" }
+          Get-Item $p | Select-Object FullName,Length,LastWriteTime | Format-Table -AutoSize
 
-      - name: Build BlackBone x64 first
+      - name: Build 02 - BlackBone
         shell: cmd
         run: >
           msbuild lib\Blackbone\src\BlackBone\BlackBone.vcxproj
-          /m
+          /m:1
           /t:Build
           /p:Configuration=Release
           /p:Platform=x64
@@ -116,180 +152,311 @@ jobs:
           /p:PlatformToolset=v142
           /verbosity:minimal
 
-      - name: Verify BlackBone.lib
+      - name: Verify 02 - BlackBone.lib
         shell: powershell
         run: |
-          $matches = Get-ChildItem . -Recurse -File -Filter "BlackBone.lib"
-          if (-not $matches) {
-            throw "BlackBone.lib was not produced."
+          $p = "src\ProtoInput\build\x64\Release\BlackBone.lib"
+          if (-not (Test-Path $p)) {
+            Write-Host "BlackBone candidates:"
+            Get-ChildItem . -Recurse -File -Filter "BlackBone.lib" |
+              Select-Object FullName,Length | Format-Table -AutoSize
+            throw "Missing expected BlackBone.lib: $p"
           }
-          $matches | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize
+          Get-Item $p | Select-Object FullName,Length,LastWriteTime | Format-Table -AutoSize
 
-      # OpenXinput.vcxproj requires DEVOBJ.lib, but ProtoInput.sln does not
-      # declare OpenXinput -> DEVOBJ as a project dependency. Build them in
-      # the required order explicitly through the solution so SolutionDir
-      # stays src\ProtoInput\ and DEVOBJ.lib lands in tmp\Release64.
-      - name: Build DEVOBJ x64 first
-        shell: cmd
-        run: >
-          msbuild src\ProtoInput\ProtoInput.sln
-          /m:1
-          /t:DEVOBJ
-          /p:Configuration=Release
-          /p:Platform=x64
-          /p:WindowsTargetPlatformVersion=10.0.19041.0
-          /p:PlatformToolset=v142
-          /verbosity:minimal
-
-      - name: Verify DEVOBJ.lib
+      # DEVOBJ uses $(SolutionDir) to decide its output location.
+      # Explicitly set it to the directory containing ProtoInput.sln.
+      - name: Build 03 - DEVOBJ
         shell: powershell
         run: |
-          $expected = Join-Path $PWD "src\ProtoInput\tmp\Release64\DEVOBJ.lib"
-          if (-not (Test-Path $expected)) {
-            Write-Host "All DEVOBJ.lib candidates:"
+          $ErrorActionPreference = "Stop"
+          $solutionDir = (Resolve-Path "src\ProtoInput").Path + "\"
+
+          & msbuild "lib\openxinput-OpenXinput1_4\DEVOBJ\DEVOBJ.vcxproj" `
+            /m:1 `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+            /p:PlatformToolset=v142 `
+            "/p:SolutionDir=$solutionDir" `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "DEVOBJ build failed: $LASTEXITCODE"
+          }
+
+      - name: Verify 03 - DEVOBJ.lib
+        shell: powershell
+        run: |
+          $p = "src\ProtoInput\tmp\Release64\DEVOBJ.lib"
+          if (-not (Test-Path $p)) {
+            Write-Host "DEVOBJ candidates:"
             Get-ChildItem . -Recurse -File -Filter "DEVOBJ.lib" |
-              Select-Object FullName, Length, LastWriteTime |
-              Format-Table -AutoSize
-            throw "Expected DEVOBJ.lib not found: $expected"
+              Select-Object FullName,Length | Format-Table -AutoSize
+            throw "Missing expected DEVOBJ.lib: $p"
           }
+          Get-Item $p | Select-Object FullName,Length,LastWriteTime | Format-Table -AutoSize
 
-          Write-Host "DEVOBJ ready:"
-          Get-Item $expected |
-            Select-Object FullName, Length, LastWriteTime |
-            Format-Table -AutoSize
-
-      - name: Build OpenXinput x64 second
-        shell: cmd
-        run: >
-          msbuild src\ProtoInput\ProtoInput.sln
-          /m:1
-          /t:OpenXinput
-          /p:Configuration=Release
-          /p:Platform=x64
-          /p:WindowsTargetPlatformVersion=10.0.19041.0
-          /p:PlatformToolset=v142
-          /verbosity:minimal
-
-      - name: Verify OpenXinput64.lib
+      # OpenXinput has a ProjectReference to DEVOBJ, but DEVOBJ is already built.
+      # Disable ProjectReferences here so the order remains deterministic.
+      - name: Build 04 - OpenXinput64 static library
         shell: powershell
         run: |
-          $expected = Join-Path $PWD "src\ProtoInput\Release\OpenXinput64.lib"
-          if (-not (Test-Path $expected)) {
-            Write-Host "All OpenXinput*.lib candidates:"
-            Get-ChildItem . -Recurse -File -Filter "OpenXinput*.lib" |
-              Select-Object FullName, Length, LastWriteTime |
-              Format-Table -AutoSize
-            throw "Expected OpenXinput64.lib not found: $expected"
+          $ErrorActionPreference = "Stop"
+          $solutionDir = (Resolve-Path "src\ProtoInput").Path + "\"
+
+          & msbuild "lib\openxinput-OpenXinput1_4\OpenXinput.vcxproj" `
+            /m:1 `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+            /p:PlatformToolset=v142 `
+            /p:BuildProjectReferences=false `
+            "/p:SolutionDir=$solutionDir" `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "OpenXinput build failed: $LASTEXITCODE"
           }
 
-          Write-Host "OpenXinput ready:"
-          Get-Item $expected |
-            Select-Object FullName, Length, LastWriteTime |
-            Format-Table -AutoSize
-
-      - name: Build ProtoInput Release x64
-        shell: cmd
-        run: >
-          msbuild src\ProtoInput\ProtoInput.sln
-          /m:1
-          /t:Build
-          /p:Configuration=Release
-          /p:Platform=x64
-          /p:WindowsTargetPlatformVersion=10.0.19041.0
-          /p:PlatformToolset=v142
-          /p:BuildProjectReferences=false
-          /verbosity:minimal
-
-      - name: Inspect ProtoInput outputs
+      - name: Verify 04 - OpenXinput64.lib
         shell: powershell
         run: |
-          Get-ChildItem . -Recurse -File |
-            Where-Object {
-              $_.Name -match '^ProtoInput.*\.(dll|exe)$' -or
-              $_.Name -eq 'EasyHook64.dll' -or
-              $_.Name -eq 'OpenXinput64.dll'
-            } |
-            Sort-Object FullName |
-            Select-Object FullName, Length, LastWriteTime |
-            Format-Table -AutoSize
+          $p = "src\ProtoInput\Release\OpenXinput64.lib"
+          if (-not (Test-Path $p)) { throw "Missing: $p" }
+          Get-Item $p | Select-Object FullName,Length,LastWriteTime | Format-Table -AutoSize
 
-      - name: Collect x64 runtime files
+      - name: Build 05 - ProtoInputUtilStatic64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $solutionDir = (Resolve-Path "src\ProtoInput").Path + "\"
+
+          & msbuild "src\ProtoInput\ProtoInputUtil\ProtoInputUtil.vcxproj" `
+            /m:1 `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+            /p:PlatformToolset=v142 `
+            "/p:SolutionDir=$solutionDir" `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) { throw "ProtoInputUtilStatic build failed: $LASTEXITCODE" }
+
+      - name: Verify 05 - ProtoInputUtilStatic64.lib
+        shell: powershell
+        run: |
+          $p = "src\ProtoInput\Release\ProtoInputUtilStatic64.lib"
+          if (-not (Test-Path $p)) { throw "Missing: $p" }
+          Get-Item $p | Select-Object FullName,Length,LastWriteTime | Format-Table -AutoSize
+
+      - name: Build 06 - ProtoInputUtilDynamic64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $solutionDir = (Resolve-Path "src\ProtoInput").Path + "\"
+
+          & msbuild "src\ProtoInput\ProtoInputUtilDynamic\ProtoInputUtilDynamic.vcxproj" `
+            /m:1 `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+            /p:PlatformToolset=v142 `
+            "/p:SolutionDir=$solutionDir" `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) { throw "ProtoInputUtilDynamic build failed: $LASTEXITCODE" }
+
+      - name: Build 07 - ProtoInputIJP64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $solutionDir = (Resolve-Path "src\ProtoInput").Path + "\"
+
+          & msbuild "src\ProtoInput\ProtoInputInjectorProxy\ProtoInputInjectorProxy.vcxproj" `
+            /m:1 `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+            /p:PlatformToolset=v142 `
+            "/p:SolutionDir=$solutionDir" `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) { throw "ProtoInputInjectorProxy build failed: $LASTEXITCODE" }
+
+      - name: Build 08 - ProtoInputIJ64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $solutionDir = (Resolve-Path "src\ProtoInput").Path + "\"
+
+          & msbuild "src\ProtoInput\ProtoInputInjector\ProtoInputInjector.vcxproj" `
+            /m:1 `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+            /p:PlatformToolset=v142 `
+            "/p:SolutionDir=$solutionDir" `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) { throw "ProtoInputInjector build failed: $LASTEXITCODE" }
+
+      # Hooks require exactly the libraries built above:
+      # BlackBone + UtilStatic + OpenXinput + EasyHook.
+      - name: Build 09 - ProtoInputHooks64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $solutionDir = (Resolve-Path "src\ProtoInput").Path + "\"
+
+          & msbuild "src\ProtoInput\ProtoInputHooks\ProtoInputHooks.vcxproj" `
+            /m:1 `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+            /p:PlatformToolset=v142 `
+            "/p:SolutionDir=$solutionDir" `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) { throw "ProtoInputHooks build failed: $LASTEXITCODE" }
+
+      # Loader's solution-level dependencies include Hooks and Injector.
+      # Both already exist now, so build Loader after them.
+      - name: Build 10 - ProtoInputLoader64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $solutionDir = (Resolve-Path "src\ProtoInput").Path + "\"
+
+          & msbuild "src\ProtoInput\ProtoInputLoader\ProtoInputLoader.vcxproj" `
+            /m:1 `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+            /p:PlatformToolset=v142 `
+            "/p:SolutionDir=$solutionDir" `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) { throw "ProtoInputLoader build failed: $LASTEXITCODE" }
+
+      - name: Build 11 - ProtoInputHost x64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $solutionDir = (Resolve-Path "src\ProtoInput").Path + "\"
+
+          & msbuild "src\ProtoInput\ProtoInputHost\ProtoInputHost.vcxproj" `
+            /m:1 `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+            /p:PlatformToolset=v142 `
+            "/p:SolutionDir=$solutionDir" `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) { throw "ProtoInputHost build failed: $LASTEXITCODE" }
+
+      # Use exact paths: do not recursively pick a same-named stale binary.
+      - name: Verify all final x64 outputs
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          $out = Join-Path $PWD "artifact\protoinput-x64"
-          New-Item -ItemType Directory -Force -Path $out | Out-Null
-
-          $wanted = @(
-            "ProtoInputLoader64.dll",
-            "ProtoInputHooks64.dll",
-            "ProtoInputHost.exe",
-            "ProtoInputIJ64.exe",
-            "ProtoInputIJP64.dll",
-            "ProtoInputUtilDynamic64.dll"
+          $required = @(
+            "src\ProtoInput\Release\ProtoInputUtilDynamic64.dll",
+            "src\ProtoInput\Release\ProtoInputIJP64.dll",
+            "src\ProtoInput\Release\ProtoInputIJ64.exe",
+            "src\ProtoInput\Release\ProtoInputHooks64.dll",
+            "src\ProtoInput\Release\ProtoInputLoader64.dll",
+            "src\ProtoInput\Release\x64\ProtoInputHost.exe"
           )
 
-          foreach ($name in $wanted) {
-            $matches = Get-ChildItem . -Recurse -File -Filter $name |
-              Where-Object { $_.FullName -notmatch '\\artifact\\' }
-
-            if (-not $matches) {
-              Write-Warning "Not found: $name"
-              continue
+          foreach ($p in $required) {
+            if (-not (Test-Path $p)) {
+              throw "Required final binary missing: $p"
             }
-
-            $pick = $matches |
-              Sort-Object @{
-                Expression = {
-                  if ($_.FullName -match '\\src\\ProtoInput\\Release\\') { 0 }
-                  else { 1 }
-                }
-              }, FullName |
-              Select-Object -First 1
-
-            Copy-Item $pick.FullName (Join-Path $out $name) -Force
-            Write-Host "Collected: $name"
-            Write-Host "  from $($pick.FullName)"
+            Get-Item $p |
+              Select-Object FullName,Length,LastWriteTime |
+              Format-Table -AutoSize
           }
 
-          foreach ($dep in @("EasyHook64.dll", "OpenXinput64.dll")) {
-            $pick = Get-ChildItem . -Recurse -File -Filter $dep |
-              Where-Object { $_.FullName -notmatch '\\artifact\\' } |
-              Select-Object -First 1
+      - name: Verify Loader exports and PE dependencies
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
 
-            if ($pick) {
-              Copy-Item $pick.FullName (Join-Path $out $dep) -Force
-              Write-Host "Collected dependency: $dep"
-            }
-          }
-
-          Write-Host "`n=== Final artifact ==="
-          Get-ChildItem $out |
-            Select-Object Name, Length, LastWriteTime |
-            Format-Table -AutoSize
-
-          $loader = Join-Path $out "ProtoInputLoader64.dll"
-          if (-not (Test-Path $loader)) {
-            throw "ProtoInputLoader64.dll was not produced."
-          }
-
-          Write-Host "`n=== Required export check ==="
+          $loader = "src\ProtoInput\Release\ProtoInputLoader64.dll"
           $exports = & dumpbin /exports $loader | Out-String
 
-          $required = @(
+          $requiredExports = @(
+            "EasyHookInjectRuntime",
+            "SetupState",
+            "InstallHook",
+            "SetControllerIndex",
             "SetTranslateXinputtoMKB",
             "SetXinputtoMKBkeys",
             "SetXinputtoMKBCFG"
           )
 
-          foreach ($symbol in $required) {
+          foreach ($symbol in $requiredExports) {
             if ($exports -notmatch [regex]::Escape($symbol)) {
               Write-Host $exports
-              throw "Required export missing: $symbol"
+              throw "Required Loader export missing: $symbol"
             }
-            Write-Host "OK: $symbol"
+            Write-Host "OK export: $symbol"
           }
+
+          Write-Host "`n=== PE dependencies ==="
+          foreach ($p in @(
+            "src\ProtoInput\Release\ProtoInputLoader64.dll",
+            "src\ProtoInput\Release\ProtoInputHooks64.dll",
+            "src\ProtoInput\Release\ProtoInputIJ64.exe",
+            "src\ProtoInput\Release\ProtoInputIJP64.dll"
+          )) {
+            Write-Host "`n--- $p ---"
+            & dumpbin /dependents $p
+          }
+
+      - name: Package exact runtime files
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $out = "artifact\protoinput-x64"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $map = @{
+            "src\ProtoInput\Release\ProtoInputLoader64.dll"       = "ProtoInputLoader64.dll"
+            "src\ProtoInput\Release\ProtoInputHooks64.dll"        = "ProtoInputHooks64.dll"
+            "src\ProtoInput\Release\ProtoInputIJ64.exe"           = "ProtoInputIJ64.exe"
+            "src\ProtoInput\Release\ProtoInputIJP64.dll"          = "ProtoInputIJP64.dll"
+            "src\ProtoInput\Release\ProtoInputUtilDynamic64.dll"  = "ProtoInputUtilDynamic64.dll"
+            "src\ProtoInput\Release\x64\ProtoInputHost.exe"       = "ProtoInputHost.exe"
+          }
+
+          foreach ($src in $map.Keys) {
+            Copy-Item $src (Join-Path $out $map[$src]) -Force
+          }
+
+          Write-Host "=== Artifact contents ==="
+          Get-ChildItem $out |
+            Select-Object Name,Length,LastWriteTime |
+            Format-Table -AutoSize
+
+          Write-Host "`n=== SHA256 ==="
+          Get-ChildItem $out -File |
+            Get-FileHash -Algorithm SHA256 |
+            Select-Object Path,Hash |
+            Format-Table -AutoSize
 
       - name: Upload ProtoInput x64 artifact
         uses: actions/upload-artifact@v4
