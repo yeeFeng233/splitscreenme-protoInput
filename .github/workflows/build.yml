@@ -2,14 +2,6 @@ name: Build ProtoInput x64
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - master
-      - main
-    paths:
-      - "src/ProtoInput/**"
-      - "lib/**"
-      - ".github/workflows/build.yml"
 
 jobs:
   build:
@@ -19,9 +11,70 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Loads the VS2022 x64 developer environment.
-      # windows-2022 currently contains the v142 toolset needed by
-      # ProtoInput Release|x64.
+      - name: Install missing v142 ATL
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsPath) {
+            throw "Could not locate Visual Studio."
+          }
+
+          Write-Host "Visual Studio: $vsPath"
+
+          $v142 = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory |
+            Where-Object { $_.Name -like "14.29*" } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+
+          if (-not $v142) {
+            throw "v142 (14.29) toolset is not installed on this runner."
+          }
+
+          $atlHeader = Join-Path $v142.FullName "atlmfc\include\atlbase.h"
+
+          if (Test-Path $atlHeader) {
+            Write-Host "v142 ATL already installed:"
+            Write-Host "  $atlHeader"
+          }
+          else {
+            Write-Host "v142 ATL is missing. Installing it..."
+
+            Set-Location "C:\Program Files (x86)\Microsoft Visual Studio\Installer"
+
+            [string]$ComponentsToAdd = @(
+              "Microsoft.VisualStudio.Component.VC.14.29.16.11.ATL"
+            ) | ForEach-Object { "--add $_" }
+
+            $ArgumentList = @(
+              "modify",
+              "--installPath", "`"$vsPath`"",
+              $ComponentsToAdd,
+              "--quiet",
+              "--norestart",
+              "--nocache"
+            )
+
+            Write-Host "vs_installer.exe $($ArgumentList -join ' ')"
+
+            $p = Start-Process `
+              -FilePath ".\vs_installer.exe" `
+              -ArgumentList $ArgumentList `
+              -Wait `
+              -PassThru
+
+            Write-Host "VS Installer exit code: $($p.ExitCode)"
+
+            if (-not (Test-Path $atlHeader)) {
+              throw "v142 ATL installation finished, but atlbase.h is still missing: $atlHeader"
+            }
+          }
+
+          Write-Host "ATL check passed:"
+          Write-Host "  $atlHeader"
+
       - name: Setup MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -30,24 +83,52 @@ jobs:
       - name: Show toolchain
         shell: powershell
         run: |
-          Write-Host "MSBuild:"
+          Write-Host "=== MSBuild ==="
           msbuild -version
 
-          Write-Host "`nInstalled Windows SDKs:"
+          Write-Host "`n=== v142 ATL ==="
+          $vsPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+          Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter atlbase.h -ErrorAction SilentlyContinue |
+            Select-Object -First 10 FullName
+
+          Write-Host "`n=== Windows SDKs ==="
           Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" |
             Select-Object -ExpandProperty Name
 
-          Write-Host "`nSolution:"
-          Get-Item "src\ProtoInput\ProtoInput.sln" |
-            Select-Object FullName, Length, LastWriteTime
-
-      # ProtoInput projects request Windows SDK 10.0.18362.0, which is not
-      # present on current GitHub windows-2022 images. Retarget only at build
-      # time to 10.0.19041.0; this does NOT modify the repository files.
-      - name: Build ProtoInput Release x64
+      # ProtoInput.sln includes only EasyHookDll, but EasyHookDll itself has
+      # managed ProjectReferences. On this repository/MSBuild combination they
+      # can inherit Debug|x64 incorrectly. We only need the native EasyHook64.lib,
+      # so build EasyHookDll directly and suppress those ProjectReferences.
+      - name: Build EasyHook native x64 first
         shell: cmd
         run: >
-          msbuild src\ProtoInput\ProtoInput.sln
+          msbuild lib\EasyHook\EasyHookDll\EasyHookDll.vcxproj
+          /m
+          /t:Build
+          /p:Configuration=netfx4-Release
+          /p:Platform=x64
+          /p:WindowsTargetPlatformVersion=10.0.19041.0
+          /p:PlatformToolset=v142
+          /p:BuildProjectReferences=false
+          /verbosity:minimal
+
+      - name: Verify EasyHook64.lib
+        shell: powershell
+        run: |
+          $matches = Get-ChildItem "lib\EasyHook" -Recurse -File -Filter "EasyHook64.lib"
+          if (-not $matches) {
+            throw "EasyHook64.lib was not produced."
+          }
+
+          Write-Host "Found EasyHook64.lib:"
+          $matches | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize
+
+      # Nucleus' own contribution guide calls out BlackBone/ATL and build-order
+      # sensitivity. Pre-build BlackBone so ProtoInputUtilStatic cannot race it.
+      - name: Build BlackBone x64 first
+        shell: cmd
+        run: >
+          msbuild lib\Blackbone\src\BlackBone\BlackBone.vcxproj
           /m
           /t:Build
           /p:Configuration=Release
@@ -56,7 +137,34 @@ jobs:
           /p:PlatformToolset=v142
           /verbosity:minimal
 
-      - name: Inspect build outputs
+      - name: Verify BlackBone.lib
+        shell: powershell
+        run: |
+          $matches = Get-ChildItem . -Recurse -File -Filter "BlackBone.lib"
+          if (-not $matches) {
+            throw "BlackBone.lib was not produced."
+          }
+
+          Write-Host "Found BlackBone.lib:"
+          $matches | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize
+
+      # Now build the full ProtoInput solution. Project references are disabled
+      # because the two troublesome external dependencies were built explicitly.
+      # /m:1 avoids dependency-order races in this old solution.
+      - name: Build ProtoInput Release x64
+        shell: cmd
+        run: >
+          msbuild src\ProtoInput\ProtoInput.sln
+          /m:1
+          /t:Build
+          /p:Configuration=Release
+          /p:Platform=x64
+          /p:WindowsTargetPlatformVersion=10.0.19041.0
+          /p:PlatformToolset=v142
+          /p:BuildProjectReferences=false
+          /verbosity:minimal
+
+      - name: Inspect ProtoInput outputs
         shell: powershell
         run: |
           Write-Host "=== ProtoInput output candidates ==="
@@ -64,8 +172,8 @@ jobs:
           Get-ChildItem . -Recurse -File |
             Where-Object {
               $_.Name -match '^ProtoInput.*\.(dll|exe)$' -or
-              $_.Name -match '^EasyHook.*\.(dll|exe)$' -or
-              $_.Name -match '^OpenXinput.*\.dll$'
+              $_.Name -eq 'EasyHook64.dll' -or
+              $_.Name -eq 'OpenXinput64.dll'
             } |
             Sort-Object FullName |
             Select-Object FullName, Length, LastWriteTime |
@@ -79,7 +187,6 @@ jobs:
           $out = Join-Path $PWD "artifact\protoinput-x64"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
 
-          # Main ProtoInput x64 runtime files expected from the solution build.
           $wanted = @(
             "ProtoInputLoader64.dll",
             "ProtoInputHooks64.dll",
@@ -91,16 +198,14 @@ jobs:
 
           foreach ($name in $wanted) {
             $matches = Get-ChildItem . -Recurse -File -Filter $name |
-              Where-Object {
-                $_.FullName -notmatch '\\artifact\\'
-              }
+              Where-Object { $_.FullName -notmatch '\\artifact\\' }
 
             if (-not $matches) {
               Write-Warning "Not found: $name"
               continue
             }
 
-            # Prefer outputs under src\ProtoInput\Release.
+            # Prefer the standard ProtoInput Release output folder.
             $pick = $matches |
               Sort-Object @{
                 Expression = {
@@ -111,35 +216,27 @@ jobs:
               Select-Object -First 1
 
             Copy-Item $pick.FullName (Join-Path $out $name) -Force
-            Write-Host "Collected $name from:"
-            Write-Host "  $($pick.FullName)"
+            Write-Host "Collected: $name"
+            Write-Host "  from $($pick.FullName)"
           }
 
-          # EasyHook runtime binaries may be required by injection depending
-          # on the exact ProtoInput path used. Include them when present.
-          Get-ChildItem "lib\EasyHook\Build\x64\netfx4-Release" `
-            -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in ".dll", ".exe" } |
-            ForEach-Object {
-              Copy-Item $_.FullName (Join-Path $out $_.Name) -Force
-              Write-Host "Collected dependency: $($_.Name)"
-            }
+          # Runtime dependencies, if produced.
+          foreach ($dep in @("EasyHook64.dll", "OpenXinput64.dll")) {
+            $pick = Get-ChildItem . -Recurse -File -Filter $dep |
+              Where-Object { $_.FullName -notmatch '\\artifact\\' } |
+              Select-Object -First 1
 
-          # Include any OpenXInput x64 runtime DLL if the build produced one.
-          Get-ChildItem . -Recurse -File -Filter "OpenXinput64.dll" |
-            Select-Object -First 1 |
-            ForEach-Object {
-              Copy-Item $_.FullName (Join-Path $out $_.Name) -Force
-              Write-Host "Collected dependency: $($_.Name)"
+            if ($pick) {
+              Copy-Item $pick.FullName (Join-Path $out $dep) -Force
+              Write-Host "Collected dependency: $dep"
             }
+          }
 
-          Write-Host "`n=== Final artifact contents ==="
+          Write-Host "`n=== Final artifact ==="
           Get-ChildItem $out |
             Select-Object Name, Length, LastWriteTime |
             Format-Table -AutoSize
 
-          # The three exports we specifically need must be present in
-          # ProtoInputLoader64.dll.
           $loader = Join-Path $out "ProtoInputLoader64.dll"
           if (-not (Test-Path $loader)) {
             throw "ProtoInputLoader64.dll was not produced."
@@ -148,13 +245,13 @@ jobs:
           Write-Host "`n=== Required export check ==="
           $exports = & dumpbin /exports $loader | Out-String
 
-          $requiredExports = @(
+          $required = @(
             "SetTranslateXinputtoMKB",
             "SetXinputtoMKBkeys",
             "SetXinputtoMKBCFG"
           )
 
-          foreach ($symbol in $requiredExports) {
+          foreach ($symbol in $required) {
             if ($exports -notmatch [regex]::Escape($symbol)) {
               Write-Host $exports
               throw "Required export missing: $symbol"
