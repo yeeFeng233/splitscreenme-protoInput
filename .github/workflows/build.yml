@@ -1,0 +1,171 @@
+name: Build ProtoInput x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - "src/ProtoInput/**"
+      - "lib/**"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Loads the VS2022 x64 developer environment.
+      # windows-2022 currently contains the v142 toolset needed by
+      # ProtoInput Release|x64.
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Show toolchain
+        shell: powershell
+        run: |
+          Write-Host "MSBuild:"
+          msbuild -version
+
+          Write-Host "`nInstalled Windows SDKs:"
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" |
+            Select-Object -ExpandProperty Name
+
+          Write-Host "`nSolution:"
+          Get-Item "src\ProtoInput\ProtoInput.sln" |
+            Select-Object FullName, Length, LastWriteTime
+
+      # ProtoInput projects request Windows SDK 10.0.18362.0, which is not
+      # present on current GitHub windows-2022 images. Retarget only at build
+      # time to 10.0.19041.0; this does NOT modify the repository files.
+      - name: Build ProtoInput Release x64
+        shell: cmd
+        run: >
+          msbuild src\ProtoInput\ProtoInput.sln
+          /m
+          /t:Build
+          /p:Configuration=Release
+          /p:Platform=x64
+          /p:WindowsTargetPlatformVersion=10.0.19041.0
+          /p:PlatformToolset=v142
+          /verbosity:minimal
+
+      - name: Inspect build outputs
+        shell: powershell
+        run: |
+          Write-Host "=== ProtoInput output candidates ==="
+
+          Get-ChildItem . -Recurse -File |
+            Where-Object {
+              $_.Name -match '^ProtoInput.*\.(dll|exe)$' -or
+              $_.Name -match '^EasyHook.*\.(dll|exe)$' -or
+              $_.Name -match '^OpenXinput.*\.dll$'
+            } |
+            Sort-Object FullName |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+
+      - name: Collect x64 runtime files
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $out = Join-Path $PWD "artifact\protoinput-x64"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          # Main ProtoInput x64 runtime files expected from the solution build.
+          $wanted = @(
+            "ProtoInputLoader64.dll",
+            "ProtoInputHooks64.dll",
+            "ProtoInputHost.exe",
+            "ProtoInputIJ64.exe",
+            "ProtoInputIJP64.dll",
+            "ProtoInputUtilDynamic64.dll"
+          )
+
+          foreach ($name in $wanted) {
+            $matches = Get-ChildItem . -Recurse -File -Filter $name |
+              Where-Object {
+                $_.FullName -notmatch '\\artifact\\'
+              }
+
+            if (-not $matches) {
+              Write-Warning "Not found: $name"
+              continue
+            }
+
+            # Prefer outputs under src\ProtoInput\Release.
+            $pick = $matches |
+              Sort-Object @{
+                Expression = {
+                  if ($_.FullName -match '\\src\\ProtoInput\\Release\\') { 0 }
+                  else { 1 }
+                }
+              }, FullName |
+              Select-Object -First 1
+
+            Copy-Item $pick.FullName (Join-Path $out $name) -Force
+            Write-Host "Collected $name from:"
+            Write-Host "  $($pick.FullName)"
+          }
+
+          # EasyHook runtime binaries may be required by injection depending
+          # on the exact ProtoInput path used. Include them when present.
+          Get-ChildItem "lib\EasyHook\Build\x64\netfx4-Release" `
+            -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in ".dll", ".exe" } |
+            ForEach-Object {
+              Copy-Item $_.FullName (Join-Path $out $_.Name) -Force
+              Write-Host "Collected dependency: $($_.Name)"
+            }
+
+          # Include any OpenXInput x64 runtime DLL if the build produced one.
+          Get-ChildItem . -Recurse -File -Filter "OpenXinput64.dll" |
+            Select-Object -First 1 |
+            ForEach-Object {
+              Copy-Item $_.FullName (Join-Path $out $_.Name) -Force
+              Write-Host "Collected dependency: $($_.Name)"
+            }
+
+          Write-Host "`n=== Final artifact contents ==="
+          Get-ChildItem $out |
+            Select-Object Name, Length, LastWriteTime |
+            Format-Table -AutoSize
+
+          # The three exports we specifically need must be present in
+          # ProtoInputLoader64.dll.
+          $loader = Join-Path $out "ProtoInputLoader64.dll"
+          if (-not (Test-Path $loader)) {
+            throw "ProtoInputLoader64.dll was not produced."
+          }
+
+          Write-Host "`n=== Required export check ==="
+          $exports = & dumpbin /exports $loader | Out-String
+
+          $requiredExports = @(
+            "SetTranslateXinputtoMKB",
+            "SetXinputtoMKBkeys",
+            "SetXinputtoMKBCFG"
+          )
+
+          foreach ($symbol in $requiredExports) {
+            if ($exports -notmatch [regex]::Escape($symbol)) {
+              Write-Host $exports
+              throw "Required export missing: $symbol"
+            }
+            Write-Host "OK: $symbol"
+          }
+
+      - name: Upload ProtoInput x64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: protoinput-x64
+          path: artifact/protoinput-x64/
+          if-no-files-found: error
+          retention-days: 7
