@@ -44,20 +44,14 @@ jobs:
 
             Set-Location "C:\Program Files (x86)\Microsoft Visual Studio\Installer"
 
-            [string]$ComponentsToAdd = @(
-              "Microsoft.VisualStudio.Component.VC.14.29.16.11.ATL"
-            ) | ForEach-Object { "--add $_" }
-
             $ArgumentList = @(
               "modify",
               "--installPath", "`"$vsPath`"",
-              $ComponentsToAdd,
+              "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.ATL",
               "--quiet",
               "--norestart",
               "--nocache"
             )
-
-            Write-Host "vs_installer.exe $($ArgumentList -join ' ')"
 
             $p = Start-Process `
               -FilePath ".\vs_installer.exe" `
@@ -83,22 +77,11 @@ jobs:
       - name: Show toolchain
         shell: powershell
         run: |
-          Write-Host "=== MSBuild ==="
           msbuild -version
-
-          Write-Host "`n=== v142 ATL ==="
-          $vsPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
-          Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter atlbase.h -ErrorAction SilentlyContinue |
-            Select-Object -First 10 FullName
-
-          Write-Host "`n=== Windows SDKs ==="
+          Write-Host "`nInstalled Windows SDKs:"
           Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" |
             Select-Object -ExpandProperty Name
 
-      # ProtoInput.sln includes only EasyHookDll, but EasyHookDll itself has
-      # managed ProjectReferences. On this repository/MSBuild combination they
-      # can inherit Debug|x64 incorrectly. We only need the native EasyHook64.lib,
-      # so build EasyHookDll directly and suppress those ProjectReferences.
       - name: Build EasyHook native x64 first
         shell: cmd
         run: >
@@ -119,12 +102,8 @@ jobs:
           if (-not $matches) {
             throw "EasyHook64.lib was not produced."
           }
-
-          Write-Host "Found EasyHook64.lib:"
           $matches | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize
 
-      # Nucleus' own contribution guide calls out BlackBone/ATL and build-order
-      # sensitivity. Pre-build BlackBone so ProtoInputUtilStatic cannot race it.
       - name: Build BlackBone x64 first
         shell: cmd
         run: >
@@ -144,13 +123,70 @@ jobs:
           if (-not $matches) {
             throw "BlackBone.lib was not produced."
           }
-
-          Write-Host "Found BlackBone.lib:"
           $matches | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize
 
-      # Now build the full ProtoInput solution. Project references are disabled
-      # because the two troublesome external dependencies were built explicitly.
-      # /m:1 avoids dependency-order races in this old solution.
+      # OpenXinput.vcxproj requires DEVOBJ.lib, but ProtoInput.sln does not
+      # declare OpenXinput -> DEVOBJ as a project dependency. Build them in
+      # the required order explicitly through the solution so SolutionDir
+      # stays src\ProtoInput\ and DEVOBJ.lib lands in tmp\Release64.
+      - name: Build DEVOBJ x64 first
+        shell: cmd
+        run: >
+          msbuild src\ProtoInput\ProtoInput.sln
+          /m:1
+          /t:DEVOBJ
+          /p:Configuration=Release
+          /p:Platform=x64
+          /p:WindowsTargetPlatformVersion=10.0.19041.0
+          /p:PlatformToolset=v142
+          /verbosity:minimal
+
+      - name: Verify DEVOBJ.lib
+        shell: powershell
+        run: |
+          $expected = Join-Path $PWD "src\ProtoInput\tmp\Release64\DEVOBJ.lib"
+          if (-not (Test-Path $expected)) {
+            Write-Host "All DEVOBJ.lib candidates:"
+            Get-ChildItem . -Recurse -File -Filter "DEVOBJ.lib" |
+              Select-Object FullName, Length, LastWriteTime |
+              Format-Table -AutoSize
+            throw "Expected DEVOBJ.lib not found: $expected"
+          }
+
+          Write-Host "DEVOBJ ready:"
+          Get-Item $expected |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+
+      - name: Build OpenXinput x64 second
+        shell: cmd
+        run: >
+          msbuild src\ProtoInput\ProtoInput.sln
+          /m:1
+          /t:OpenXinput
+          /p:Configuration=Release
+          /p:Platform=x64
+          /p:WindowsTargetPlatformVersion=10.0.19041.0
+          /p:PlatformToolset=v142
+          /verbosity:minimal
+
+      - name: Verify OpenXinput64.lib
+        shell: powershell
+        run: |
+          $expected = Join-Path $PWD "src\ProtoInput\Release\OpenXinput64.lib"
+          if (-not (Test-Path $expected)) {
+            Write-Host "All OpenXinput*.lib candidates:"
+            Get-ChildItem . -Recurse -File -Filter "OpenXinput*.lib" |
+              Select-Object FullName, Length, LastWriteTime |
+              Format-Table -AutoSize
+            throw "Expected OpenXinput64.lib not found: $expected"
+          }
+
+          Write-Host "OpenXinput ready:"
+          Get-Item $expected |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+
       - name: Build ProtoInput Release x64
         shell: cmd
         run: >
@@ -167,8 +203,6 @@ jobs:
       - name: Inspect ProtoInput outputs
         shell: powershell
         run: |
-          Write-Host "=== ProtoInput output candidates ==="
-
           Get-ChildItem . -Recurse -File |
             Where-Object {
               $_.Name -match '^ProtoInput.*\.(dll|exe)$' -or
@@ -205,7 +239,6 @@ jobs:
               continue
             }
 
-            # Prefer the standard ProtoInput Release output folder.
             $pick = $matches |
               Sort-Object @{
                 Expression = {
@@ -220,7 +253,6 @@ jobs:
             Write-Host "  from $($pick.FullName)"
           }
 
-          # Runtime dependencies, if produced.
           foreach ($dep in @("EasyHook64.dll", "OpenXinput64.dll")) {
             $pick = Get-ChildItem . -Recurse -File -Filter $dep |
               Where-Object { $_.FullName -notmatch '\\artifact\\' } |
