@@ -1,4 +1,4 @@
-name: Build ProtoInput x64
+name: Build ProtoInput x64 - original SDK
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Sanity-check current ProtoInput source
+      - name: Sanity-check source without retargeting
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -50,6 +50,45 @@ jobs:
             }
             Write-Host "OK source API: $symbol"
           }
+
+
+          # ProtoInput is known to be sensitive to VS/SDK retargeting.
+          # The upstream projects intentionally target Windows SDK 18362 + v142.
+          # Fail early if upstream changes or if this fork has been retargeted.
+          $nativeSdkProjects = @(
+            "lib\EasyHook\EasyHookDll\EasyHookDll.vcxproj",
+            "lib\Blackbone\src\BlackBone\BlackBone.vcxproj",
+            "lib\openxinput-OpenXinput1_4\OpenXinput.vcxproj",
+            "src\ProtoInput\ProtoInputUtil\ProtoInputUtil.vcxproj",
+            "src\ProtoInput\ProtoInputUtilDynamic\ProtoInputUtilDynamic.vcxproj",
+            "src\ProtoInput\ProtoInputInjectorProxy\ProtoInputInjectorProxy.vcxproj",
+            "src\ProtoInput\ProtoInputInjector\ProtoInputInjector.vcxproj",
+            "src\ProtoInput\ProtoInputHooks\ProtoInputHooks.vcxproj",
+            "src\ProtoInput\ProtoInputLoader\ProtoInputLoader.vcxproj",
+            "src\ProtoInput\ProtoInputHost\ProtoInputHost.vcxproj"
+          )
+
+          foreach ($p in $nativeSdkProjects) {
+            $body = Get-Content $p -Raw
+
+            if ($body -notmatch '<WindowsTargetPlatformVersion>10\.0\.18362\.0</WindowsTargetPlatformVersion>') {
+              throw "Project is not targeting original Windows SDK 10.0.18362.0: $p"
+            }
+
+            # Release|x64 is expected to use v142 in upstream ProtoInput.
+            if ($body -notmatch '<PlatformToolset>v142</PlatformToolset>') {
+              throw "v142 toolset declaration not found: $p"
+            }
+
+            Write-Host "OK original SDK/toolset: $p"
+          }
+
+          # DEVOBJ is the one exception: upstream uses the generic 10.0 target.
+          $devobj = Get-Content "lib\openxinput-OpenXinput1_4\DEVOBJ\DEVOBJ.vcxproj" -Raw
+          if ($devobj -notmatch '<WindowsTargetPlatformVersion>10\.0</WindowsTargetPlatformVersion>') {
+            throw "Unexpected DEVOBJ SDK target."
+          }
+          Write-Host "OK DEVOBJ generic SDK target"
 
 
           # Verify the path assumptions used later in this workflow against
@@ -101,8 +140,6 @@ jobs:
             throw "Could not locate Visual Studio."
           }
 
-          Write-Host "Visual Studio: $vsPath"
-
           $v142 = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory |
             Where-Object { $_.Name -like "14.29*" } |
             Sort-Object Name -Descending |
@@ -115,7 +152,7 @@ jobs:
           $atlHeader = Join-Path $v142.FullName "atlmfc\include\atlbase.h"
 
           if (-not (Test-Path $atlHeader)) {
-            Write-Host "v142 ATL missing; installing..."
+            Write-Host "v142 ATL missing; installing ATL only..."
 
             Set-Location "C:\Program Files (x86)\Microsoft Visual Studio\Installer"
 
@@ -143,6 +180,94 @@ jobs:
 
           Write-Host "ATL OK: $atlHeader"
 
+      # Do NOT retarget ProtoInput to SDK 19041.
+      # Upstream explicitly targets 10.0.18362.0, and Nucleus documentation
+      # warns that retargeting/upgrading can produce repeated
+      # FILE_INFO_BY_HANDLE_CLASS syntax errors.
+      #
+      # VS 2022 no longer ships this legacy SDK on hosted runners, therefore
+      # install the original Windows 10 SDK 1903 standalone package from
+      # Microsoft's official archive.
+      - name: Install original Windows SDK 10.0.18362.0
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $sdkRoot = "C:\Program Files (x86)\Windows Kits\10"
+          $header = Join-Path $sdkRoot "Include\10.0.18362.0\um\Windows.h"
+          $fileApi = Join-Path $sdkRoot "Include\10.0.18362.0\um\fileapi.h"
+          $kernelLib = Join-Path $sdkRoot "Lib\10.0.18362.0\um\x64\kernel32.lib"
+
+          if ((Test-Path $header) -and (Test-Path $fileApi) -and (Test-Path $kernelLib)) {
+            Write-Host "Windows SDK 18362 already installed."
+          }
+          else {
+            $installer = Join-Path $env:RUNNER_TEMP "winsdksetup-18362.exe"
+            $log = Join-Path $env:RUNNER_TEMP "winsdk18362-install.log"
+
+            $url = "https://download.microsoft.com/download/4/2/2/42245968-6A79-4DA7-A5FB-08C0AD0AE661/windowssdk/winsdksetup.exe"
+
+            Write-Host "Downloading official Windows SDK 1903 installer..."
+            Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+
+            Write-Host "Installing Windows SDK 10.0.18362.0..."
+            $p = Start-Process `
+              -FilePath $installer `
+              -ArgumentList @(
+                "/features", "+",
+                "/quiet",
+                "/norestart",
+                "/log", "`"$log`""
+              ) `
+              -Wait `
+              -PassThru
+
+            Write-Host "SDK installer exit code: $($p.ExitCode)"
+
+            if ($p.ExitCode -notin @(0, 3010)) {
+              if (Test-Path $log) {
+                Write-Host "=== SDK installer log tail ==="
+                Get-Content $log -Tail 150
+              }
+              throw "Windows SDK 18362 installer failed with exit code $($p.ExitCode)"
+            }
+          }
+
+          foreach ($p in @($header, $fileApi, $kernelLib)) {
+            if (-not (Test-Path $p)) {
+              throw "Windows SDK 18362 installation incomplete; missing: $p"
+            }
+            Write-Host "OK SDK file: $p"
+          }
+
+          Write-Host "`nInstalled SDK directories:"
+          Get-ChildItem (Join-Path $sdkRoot "Include") -Directory |
+            Select-Object -ExpandProperty Name
+
+      - name: Verify no-retarget build environment
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $sdk = "C:\Program Files (x86)\Windows Kits\10\Include\10.0.18362.0"
+          if (-not (Test-Path $sdk)) {
+            throw "SDK 10.0.18362.0 not found after installation."
+          }
+
+          $hooksProject = Get-Content "src\ProtoInput\ProtoInputHooks\ProtoInputHooks.vcxproj" -Raw
+
+          if ($hooksProject -notmatch '<WindowsTargetPlatformVersion>10\.0\.18362\.0</WindowsTargetPlatformVersion>') {
+            throw "ProtoInputHooks has been retargeted away from 18362."
+          }
+
+          if ($hooksProject -notmatch '<PlatformToolset>v142</PlatformToolset>') {
+            throw "ProtoInputHooks no longer declares v142."
+          }
+
+          Write-Host "ProtoInputHooks target remains exactly:"
+          Write-Host "  WindowsTargetPlatformVersion = 10.0.18362.0"
+          Write-Host "  PlatformToolset = v142"
+
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -167,8 +292,6 @@ jobs:
           /t:Build
           /p:Configuration=netfx4-Release
           /p:Platform=x64
-          /p:WindowsTargetPlatformVersion=10.0.19041.0
-          /p:PlatformToolset=v142
           /p:BuildProjectReferences=false
           /verbosity:minimal
 
@@ -200,8 +323,6 @@ jobs:
             /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
-            /p:PlatformToolset=v142 `
             "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
 
@@ -242,8 +363,6 @@ jobs:
             /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
-            /p:PlatformToolset=v142 `
             "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
 
@@ -276,8 +395,6 @@ jobs:
             /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
-            /p:PlatformToolset=v142 `
             /p:BuildProjectReferences=false `
             "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
@@ -304,8 +421,6 @@ jobs:
             /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
-            /p:PlatformToolset=v142 `
             "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
 
@@ -329,8 +444,6 @@ jobs:
             /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
-            /p:PlatformToolset=v142 `
             "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
 
@@ -347,8 +460,6 @@ jobs:
             /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
-            /p:PlatformToolset=v142 `
             "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
 
@@ -365,8 +476,6 @@ jobs:
             /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
-            /p:PlatformToolset=v142 `
             "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
 
@@ -385,8 +494,6 @@ jobs:
             /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
-            /p:PlatformToolset=v142 `
             "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
 
@@ -405,8 +512,6 @@ jobs:
             /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
-            /p:PlatformToolset=v142 `
             "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
 
@@ -423,8 +528,6 @@ jobs:
             /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0.19041.0 `
-            /p:PlatformToolset=v142 `
             "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
 
